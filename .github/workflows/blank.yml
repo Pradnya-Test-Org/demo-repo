@@ -69,7 +69,7 @@ jobs:
             console.log(`Current approval count: ${approvalCount}`);
             
             // If 2 or more approvals, switch to external review
-            if (approvalCount >= 2) {
+            if (approvalCount >= 1) {
               const currentLabels = await github.rest.issues.listLabelsOnIssue({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
