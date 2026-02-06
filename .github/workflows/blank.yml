@@ -1,0 +1,102 @@
+name: PR Label Automation
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  manage-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Add initial labels on PR creation
+        if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+            
+            // Define your team mappings
+            const teamMappings = {
+              'pradnya-harbinger': 'hg-team1',
+              'rkotha2-icims': 'hg-team2'
+            };
+            
+            const teamLabel = teamMappings[author];
+            
+            if (teamLabel) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['internal-review', teamLabel]
+              });
+              
+              console.log(`Added labels: internal-review, ${teamLabel}`);
+            }
+
+      - name: Check approvals and update labels
+        if: github.event.review.state == 'approved'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            
+            // Get all reviews
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            // Count unique approvals (latest review per user)
+            const latestReviews = {};
+            reviews.data.forEach(review => {
+              if (!latestReviews[review.user.login] || 
+                  new Date(review.submitted_at) > new Date(latestReviews[review.user.login].submitted_at)) {
+                latestReviews[review.user.login] = review;
+              }
+            });
+            
+            const approvalCount = Object.values(latestReviews)
+              .filter(review => review.state === 'APPROVED').length;
+            
+            console.log(`Current approval count: ${approvalCount}`);
+            
+            // If 2 or more approvals, switch to external review
+            if (approvalCount >= 2) {
+              const currentLabels = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+              
+              // Find and remove internal-review and team labels
+              const labelsToRemove = currentLabels.data
+                .map(label => label.name)
+                .filter(name => name === 'internal-review' || name.startsWith('hg-team'));
+              
+              for (const label of labelsToRemove) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  name: label
+                });
+              }
+              
+              // Add external-review label
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['external-review']
+              });
+              
+              console.log('Switched to external review');
+            }
