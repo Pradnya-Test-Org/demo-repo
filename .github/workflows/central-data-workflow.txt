@@ -1,0 +1,170 @@
+# name: PR Label Automation - Centralized Data
+
+# on:
+#   pull_request:
+#     types: [opened, ready_for_review]
+#   pull_request_review:
+#     types: [submitted]
+
+# jobs:
+#   manage-labels:
+#     runs-on: ubuntu-latest
+#     permissions:
+#       pull-requests: write
+#       contents: read
+    
+#     steps:
+#       - name: Download team mappings from SharePoint
+#         env:
+#           MAPPINGS_URL: ${{ secrets.TEAM_MAPPINGS_URL }}
+#         run: |
+#           echo "Downloading team mappings..."
+#           curl -L "$MAPPINGS_URL" -o team-mappings.xlsx
+          
+#           # Install xlsx to csv converter
+#           pip install openpyxl pandas
+          
+#           # Convert Excel to CSV
+#           python3 << 'EOF'
+#           import pandas as pd
+#           df = pd.read_excel('team-mappings.xlsx')
+#           df.to_csv('team-mappings.csv', index=False)
+#           print("Converted Excel to CSV")
+#           EOF
+          
+#           cat team-mappings.csv
+
+#       - name: Add initial labels on PR creation
+#         if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
+#         uses: actions/github-script@v7
+#         with:
+#           script: |
+#             const fs = require('fs');
+#             const author = context.payload.pull_request.user.login;
+            
+#             // Parse CSV
+#             const csvContent = fs.readFileSync('team-mappings.csv', 'utf8');
+#             const lines = csvContent.split('\n').slice(1); // Skip header
+            
+#             const teamMappings = {};
+#             lines.forEach(line => {
+#               if (!line.trim()) return;
+#               const parts = line.split(',');
+#               const username = parts[0]?.trim().replace(/"/g, '');
+#               const teamLabel = parts[1]?.trim().replace(/"/g, '');
+#               if (username && teamLabel) {
+#                 teamMappings[username.toLowerCase()] = teamLabel;
+#               }
+#             });
+            
+#             console.log('📋 Team mappings loaded:', Object.keys(teamMappings).length, 'members');
+            
+#             const teamLabel = teamMappings[author.toLowerCase()];
+            
+#             // Only add labels if user is in the mapping list
+#             if (teamLabel) {
+#               await github.rest.issues.addLabels({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: context.payload.pull_request.number,
+#                 labels: ['internal-review', teamLabel]
+#               });
+              
+#               console.log(`✅ Added labels for ${author}: internal-review, ${teamLabel}`);
+#             } else {
+#               console.log(`⚠️ User ${author} not in team mappings - no labels added`);
+#             }
+
+#       - name: Check approvals and update labels
+#         if: github.event.review.state == 'approved'
+#         uses: actions/github-script@v7
+#         with:
+#           script: |
+#             const fs = require('fs');
+#             const prNumber = context.payload.pull_request.number;
+#             const prAuthor = context.payload.pull_request.user.login.toLowerCase();
+            
+#             // Parse CSV to get valid team members
+#             const csvContent = fs.readFileSync('team-mappings.csv', 'utf8');
+#             const lines = csvContent.split('\n').slice(1);
+            
+#             const validReviewers = new Set();
+#             lines.forEach(line => {
+#               if (!line.trim()) return;
+#               const parts = line.split(',');
+#               const username = parts[0]?.trim().replace(/"/g, '');
+#               if (username) {
+#                 validReviewers.add(username.toLowerCase());
+#               }
+#             });
+            
+#             console.log('👥 Valid reviewers count:', validReviewers.size);
+            
+#             // Get all reviews
+#             const reviews = await github.rest.pulls.listReviews({
+#               owner: context.repo.owner,
+#               repo: context.repo.repo,
+#               pull_number: prNumber
+#             });
+            
+#             // Get latest review per user (exclude PR author)
+#             const latestReviews = {};
+#             reviews.data.forEach(review => {
+#               const reviewer = review.user.login.toLowerCase();
+#               // Skip if reviewer is the PR author
+#               if (reviewer === prAuthor) return;
+              
+#               if (!latestReviews[reviewer] || 
+#                   new Date(review.submitted_at) > new Date(latestReviews[reviewer].submitted_at)) {
+#                 latestReviews[reviewer] = review;
+#               }
+#             });
+            
+#             // Count approvals only from valid team members (excluding PR author)
+#             const validApprovals = Object.entries(latestReviews)
+#               .filter(([reviewer, review]) => 
+#                 validReviewers.has(reviewer) && review.state === 'APPROVED'
+#               );
+            
+#             const approvalCount = validApprovals.length;
+#             const approvers = validApprovals.map(([r]) => r).join(', ');
+            
+#             console.log(`✓ Valid approvals: ${approvalCount}/2 from: ${approvers || 'none'}`);
+            
+#             // If 2 or more valid approvals, switch to external review
+#             if (approvalCount >= 2) {
+#               const currentLabels = await github.rest.issues.listLabelsOnIssue({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: prNumber
+#               });
+              
+#               // Remove internal-review and team labels
+#               const labelsToRemove = currentLabels.data
+#                 .map(label => label.name)
+#                 .filter(name => name === 'internal-review' || name.startsWith('hg-team'));
+              
+#               if (labelsToRemove.length > 0) {
+#                 console.log(`🗑️ Removing labels: ${labelsToRemove.join(', ')}`);
+#                 for (const label of labelsToRemove) {
+#                   await github.rest.issues.removeLabel({
+#                     owner: context.repo.owner,
+#                     repo: context.repo.repo,
+#                     issue_number: prNumber,
+#                     name: label
+#                   }).catch(err => console.log(`Label ${label} already removed`));
+#                 }
+#               }
+              
+#               // Add external-review label
+#               await github.rest.issues.addLabels({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: prNumber,
+#                 labels: ['external-review']
+#               });
+              
+#               console.log('🎉 Switched to external review after 2 valid approvals');
+#             } else {
+#               console.log(`⏳ Need ${2 - approvalCount} more valid approval(s) from team members`);
+#             }

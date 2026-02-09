@@ -1,0 +1,166 @@
+name: PR Label Automation - GitHub-variable
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  manage-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Add initial labels on PR creation
+        if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
+        env:
+          TEAM_MAPPINGS: ${{ vars.TEAMMEMBERS }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login.toLowerCase();
+            
+            // Parse team mappings from organization variable
+            let teamMappings = {};
+            try {
+              const rawMappings = JSON.parse(process.env.TEAM_MAPPINGS || '{}');
+              // Convert all keys to lowercase for case-insensitive matching
+              teamMappings = Object.fromEntries(
+                Object.entries(rawMappings).map(([k, v]) => [k.toLowerCase(), v])
+              );
+            } catch (error) {
+              console.error('❌ Error parsing TEAMMEMBERS variable:', error);
+              return;
+            }
+            
+            console.log(`📋 Loaded ${Object.keys(teamMappings).length} team members from TEAMMEMBERS variable`);
+            
+            const teamLabel = teamMappings[author];
+            
+            // Only add labels if user is in the team mappings
+            if (teamLabel) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['internal-review', teamLabel]
+              });
+              
+              console.log(`✅ Added labels for ${author}: internal-review, ${teamLabel}`);
+            } else {
+              console.log(`⚠️ User ${author} not found in TEAMMEMBERS - no labels added`);
+              console.log(`   PR author must be in the team mappings to get labels`);
+            }
+
+      - name: Check approvals and update labels
+        if: github.event.review.state == 'approved'
+        env:
+          TEAM_MAPPINGS: ${{ vars.TEAMMEMBERS }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const prAuthor = context.payload.pull_request.user.login.toLowerCase();
+            
+            // Parse team mappings
+            let teamMappings = {};
+            try {
+              const rawMappings = JSON.parse(process.env.TEAM_MAPPINGS || '{}');
+              teamMappings = Object.fromEntries(
+                Object.entries(rawMappings).map(([k, v]) => [k.toLowerCase(), v])
+              );
+            } catch (error) {
+              console.error('❌ Error parsing TEAMMEMBERS variable:', error);
+              return;
+            }
+            
+            // Create set of valid reviewers
+            const validReviewers = new Set(Object.keys(teamMappings));
+            
+            console.log(`👥 Valid team members: ${validReviewers.size}`);
+            console.log(`🎯 Need 2 approvals from team members (excluding PR author)`);
+            
+            // Get all reviews for this PR
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            // Get the latest review from each user (exclude PR author)
+            const latestReviews = {};
+            reviews.data.forEach(review => {
+              const reviewer = review.user.login.toLowerCase();
+              
+              // Skip if reviewer is the PR author
+              if (reviewer === prAuthor) {
+                return;
+              }
+              
+              // Keep only the latest review from each reviewer
+              if (!latestReviews[reviewer] || 
+                  new Date(review.submitted_at) > new Date(latestReviews[reviewer].submitted_at)) {
+                latestReviews[reviewer] = review;
+              }
+            });
+            
+            // Count approvals only from valid team members
+            const validApprovals = Object.entries(latestReviews)
+              .filter(([reviewer, review]) => 
+                validReviewers.has(reviewer) && review.state === 'APPROVED'
+              );
+            
+            const approvalCount = validApprovals.length;
+            const approvers = validApprovals.map(([reviewer]) => reviewer).join(', ');
+            
+            console.log(`✓ Valid approvals: ${approvalCount}/2`);
+            if (approvalCount > 0) {
+              console.log(`  Approved by: ${approvers}`);
+            }
+            
+            // If we have 2 or more valid approvals, switch to external review
+            if (approvalCount >= 2) {
+              console.log('🎯 Threshold met! Switching to external review...');
+              
+              // Get current labels on the PR
+              const currentLabels = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+              
+              // Find and remove internal-review and team-specific labels
+              const labelsToRemove = currentLabels.data
+                .map(label => label.name)
+                .filter(name => name === 'internal-review' || name.startsWith('hg-team'));
+              
+              if (labelsToRemove.length > 0) {
+                console.log(`🗑️  Removing labels: ${labelsToRemove.join(', ')}`);
+                
+                for (const label of labelsToRemove) {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    name: label
+                  }).catch(err => {
+                    console.log(`   Note: Label "${label}" may have been already removed`);
+                  });
+                }
+              }
+              
+              // Add external-review label
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['external-review']
+              });
+              
+              console.log('🎉 Successfully switched to external-review!');
+            } else {
+              console.log(`⏳ Need ${2 - approvalCount} more valid approval(s) from team members`);
+            }
