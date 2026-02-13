@@ -1,0 +1,201 @@
+name: PR Label Automation
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  manage-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      members: read
+      organization: read
+    
+    steps:
+      - name: Add initial labels on PR creation
+        if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
+        env:
+          TEAM_LABELS: ${{ vars.TEAM_LABELS_MAP }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+            const org = context.repo.owner;
+            
+            // Parse team-to-label mapping
+            let teamLabelsMap = {};
+            try {
+              teamLabelsMap = JSON.parse(process.env.TEAM_LABELS);
+            } catch (error) {
+              console.error('❌ Error parsing TEAM_LABELS_MAP:', error);
+              return;
+            }
+            
+            console.log(`📋 Checking ${Object.keys(teamLabelsMap).length} teams for user: ${author}`);
+            
+            // Find which team(s) the PR author belongs to
+            let authorTeam = null;
+            let authorTeamLabel = null;
+            
+            for (const [teamSlug, labelName] of Object.entries(teamLabelsMap)) {
+              try {
+                // Check if user is a member of this team
+                const { data: membership } = await github.rest.teams.getMembershipForUserInOrg({
+                  org: org,
+                  team_slug: teamSlug,
+                  username: author
+                }).catch(() => ({ data: null }));
+                
+                if (membership && membership.state === 'active') {
+                  authorTeam = teamSlug;
+                  authorTeamLabel = labelName;
+                  console.log(`✓ ${author} is a member of team: ${teamSlug}`);
+                  break; // Found the team, stop searching
+                }
+              } catch (error) {
+                // User not in this team, continue checking others
+                continue;
+              }
+            }
+            
+            // Add labels if user belongs to a configured team
+            if (authorTeamLabel) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['internal-review', authorTeamLabel]
+              });
+              
+              console.log(`✅ Added labels: internal-review, ${authorTeamLabel}`);
+            } else {
+              console.log(`⚠️ User ${author} is not in any configured team - no labels added`);
+            }
+
+      - name: Check approvals and update labels
+        if: github.event.review.state == 'approved'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const prAuthor = context.payload.pull_request.user.login;
+            const org = context.repo.owner;
+            
+            // Parse team configuration
+            let teamLabelsMap = {
+                                    "Hg-team-1": "hg-team1",
+                                    "Hg-team-2": "hg-team2",
+                                    "Hg-team-3": "hg-team3"
+                                };
+            
+            
+            // Get all team members from configured teams
+            const validReviewers = new Set();
+            
+            for (const teamSlug of Object.keys(teamLabelsMap)) {
+              try {
+                const { data: members } = await github.rest.teams.listMembersInOrg({
+                  org: org,
+                  team_slug: teamSlug,
+                  per_page: 100
+                });
+                
+                members.forEach(member => {
+                  validReviewers.add(member.login.toLowerCase());
+                });
+                
+                console.log(`  ✓ Team ${teamSlug}: ${members.length} members`);
+              } catch (error) {
+                console.error(`  ✗ Error fetching team ${teamSlug}:`, error.message);
+              }
+            }
+            
+            console.log(`📊 Total valid reviewers across all teams: ${validReviewers.size}`);
+            console.log(`🎯 Need 2 approvals from team members (excluding PR author: ${prAuthor})`);
+            
+            // Get all reviews for this PR
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            // Get latest review from each user (excluding PR author)
+            const latestReviews = {};
+            reviews.data.forEach(review => {
+              const reviewer = review.user.login.toLowerCase();
+              
+              // Skip if reviewer is the PR author
+              if (reviewer === prAuthor.toLowerCase()) {
+                return;
+              }
+              
+              // Keep only the latest review from each reviewer
+              if (!latestReviews[reviewer] || 
+                  new Date(review.submitted_at) > new Date(latestReviews[reviewer].submitted_at)) {
+                latestReviews[reviewer] = review;
+              }
+            });
+            
+            // Count approvals only from valid team members
+            const validApprovals = Object.entries(latestReviews)
+              .filter(([reviewer, review]) => 
+                validReviewers.has(reviewer) && review.state === 'APPROVED'
+              );
+            
+            const approvalCount = validApprovals.length;
+            const approvers = validApprovals.map(([reviewer]) => reviewer).join(', ');
+            
+            console.log(`✓ Valid approvals: ${approvalCount}/2`);
+            if (approvalCount > 0) {
+              console.log(`  Approved by: ${approvers}`);
+            }
+            
+            // If we have 2 or more valid approvals, switch to external review
+            if (approvalCount >= 2) {
+              console.log('🎯 Threshold met! Switching to external review...');
+              
+              // Get current labels
+              const currentLabels = await github.rest.issues.listLabelsOnIssue({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber
+              });
+              
+              // Remove internal-review and team-specific labels
+              const labelsToRemove = currentLabels.data
+                .map(label => label.name)
+                .filter(name => name === 'internal-review' || name.startsWith('hg-team'));
+              
+              if (labelsToRemove.length > 0) {
+                console.log(`🗑️  Removing labels: ${labelsToRemove.join(', ')}`);
+                
+                for (const label of labelsToRemove) {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    name: label
+                  }).catch(err => {
+                    console.log(`   Note: Label "${label}" already removed`);
+                  });
+                }
+              }
+              
+              // Add external-review label
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['external-review']
+              });
+              
+              console.log('🎉 Successfully switched to external-review!');
+            } else {
+              console.log(`⏳ Need ${2 - approvalCount} more valid approval(s) from team members`);
+            }
