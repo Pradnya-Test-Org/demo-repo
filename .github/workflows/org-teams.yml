@@ -11,16 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-      contents: read
-      members: read
-      organization: read
-    
+      contents: read    
     steps:
       - name: Add initial labels on PR creation
         if: github.event.action == 'opened' || github.event.action == 'ready_for_review'
-        env:
-          TEAM_LABELS: ${{ vars.TEAM_LABELS_MAP }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: actions/github-script@v7
         with:
           script: |
