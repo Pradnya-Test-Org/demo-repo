@@ -22,15 +22,12 @@ jobs:
             const org = context.repo.owner;
             
             // Parse team-to-label mapping
-            let teamLabelsMap = {};
-            try {
-              teamLabelsMap = JSON.parse(process.env.TEAM_LABELS);
-            } catch (error) {
-              console.error('❌ Error parsing TEAM_LABELS_MAP:', error);
-              return;
-            }
+            let teamLabelsMap = {
+                                    "Hg-team-1": "hg-team1",
+                                    "Hg-team-2": "hg-team2",
+                                    "Hg-team-3": "hg-team3"
+                                };
             
-            console.log(`📋 Checking ${Object.keys(teamLabelsMap).length} teams for user: ${author}`);
             
             // Find which team(s) the PR author belongs to
             let authorTeam = null;
